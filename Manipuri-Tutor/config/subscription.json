@@ -1,0 +1,28 @@
+{
+  "free_trial_limit": 999,
+  "currency": "INR",
+  "plans": {
+    "weekly": {
+      "name": "Weekly",
+      "price_inr": 29,
+      "duration_days": 7,
+      "stripe_price_id": "price_REPLACE_WEEKLY",
+      "tagline": "Try it for a week"
+    },
+    "monthly": {
+      "name": "Monthly",
+      "price_inr": 99,
+      "duration_days": 30,
+      "stripe_price_id": "price_REPLACE_MONTHLY",
+      "tagline": "Most popular",
+      "featured": true
+    },
+    "yearly": {
+      "name": "Yearly",
+      "price_inr": 499,
+      "duration_days": 365,
+      "stripe_price_id": "price_REPLACE_YEARLY",
+      "tagline": "Best value — save 58%"
+    }
+  }
+}
