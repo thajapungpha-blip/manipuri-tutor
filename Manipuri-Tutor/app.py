@@ -1,10 +1,9 @@
 """
 Manipuri Tutor — main Streamlit application.
-v2: Clear button, image cropper, poem detection.
+v3: Clear button + poem detection (cropper removed).
 """
 
 import html
-import io
 
 try:
     from dotenv import load_dotenv
@@ -13,7 +12,6 @@ except Exception:
     pass
 
 import streamlit as st
-from PIL import Image
 
 from modules.auth import (
     initialize_firebase,
@@ -36,7 +34,12 @@ from modules.ocr import (
     mime_for_filename,
     IMAGE_EXTENSIONS,
 )
-from modules.gemini_tutor import translate_sentences, detect_poem
+try:
+    from modules.gemini_tutor import translate_sentences, detect_poem
+except ImportError:
+    from modules.gemini_tutor import translate_sentences
+    def detect_poem(sentences):
+        return False
 from modules.transliterate import bengali_to_meitei_mayek
 from modules.bhashini_tts import synthesize_speech
 from modules.stripe_payments import (
@@ -79,9 +82,6 @@ _DEFAULTS = {
     "script_choice": "Meitei Mayek",
     "voice_choice": "Female",
     "uploaded_filename": None,
-    "crop_image_bytes": None,
-    "crop_mime": None,
-    "awaiting_crop": False,
     "_payment_checked": False,
 }
 for _k, _v in _DEFAULTS.items():
@@ -284,40 +284,10 @@ def _clear_translation():
     st.session_state.sections = None
     st.session_state.uploaded_filename = None
     st.session_state.is_poem = False
-    st.session_state.awaiting_crop = False
-    st.session_state.crop_image_bytes = None
-    st.session_state.crop_mime = None
     # Clear all audio cache
     for k in list(st.session_state.keys()):
         if k.startswith("audio_") or k.startswith("full_audio"):
             del st.session_state[k]
-
-
-# ---------------------------------------------------------------------------
-# Image crop helper
-# ---------------------------------------------------------------------------
-def _show_cropper(img_file) -> bytes | None:
-    """Show crop interface for a single image. Returns cropped bytes or None."""
-    try:
-        from streamlit_cropper import st_cropper
-        pil_img = Image.open(img_file)
-        st.markdown("### ✂️ Crop your photo")
-        st.caption("Drag the corners to select only the textbook page. Then click **Use this crop**.")
-        cropped = st_cropper(
-            pil_img,
-            realtime_update=True,
-            box_color="#4CAF50",
-            aspect_ratio=None,
-        )
-        if st.button("✅ Use this crop", type="primary", key="btn_use_crop"):
-            buf = io.BytesIO()
-            cropped.save(buf, format="JPEG", quality=95)
-            return buf.getvalue()
-        return None
-    except ImportError:
-        # streamlit-cropper not installed — skip crop
-        img_file.seek(0)
-        return img_file.read()
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +336,6 @@ def render_main():
         st.session_state.uploaded_filename = upload_id
         st.session_state.sections = None
         st.session_state.is_poem = False
-        st.session_state.awaiting_crop = False
 
         pdf_files = [f for f in uploaded_files if f.name.lower().endswith(".pdf")]
         image_files = [f for f in uploaded_files
@@ -385,61 +354,32 @@ def render_main():
                     return
 
         elif image_files:
-            # Single image: show cropper first
-            if len(image_files) == 1:
-                img_file = image_files[0]
-                mime = mime_for_filename(img_file.name)
+            progress = st.progress(0.0, text="Reading photos…")
+            for idx, img in enumerate(image_files):
+                progress.progress(
+                    idx / max(len(image_files), 1),
+                    text=f"Reading photo {idx + 1} of {len(image_files)}: {img.name}",
+                )
 
-                # Check if cropper result is already stored
-                if not st.session_state.crop_image_bytes:
-                    st.session_state.crop_mime = mime
-                    img_file.seek(0)
-                    cropped_bytes = _show_cropper(img_file)
-                    if cropped_bytes is None:
-                        # Waiting for user to confirm crop
-                        return
-                    st.session_state.crop_image_bytes = cropped_bytes
-
-                # Use stored cropped image
-                with st.spinner("Reading photo…"):
+                def _ocr_wait(secs, attempt, _idx=idx, _img=img):
                     try:
-                        sentences = extract_sentences_from_image(
-                            st.session_state.crop_image_bytes,
-                            st.session_state.crop_mime or mime,
+                        progress.progress(
+                            _idx / max(len(image_files), 1),
+                            text=f"Rate limit — waiting {int(secs)}s…",
                         )
-                    except Exception as e:
-                        st.error(f"Could not read photo: {e}")
-                        return
+                    except Exception:
+                        pass
 
-            else:
-                # Multiple images: no crop, process all
-                st.info("Multiple photos detected — cropping skipped. Upload one at a time for cropping.")
-                progress = st.progress(0.0, text="Reading photos…")
-                for idx, img in enumerate(image_files):
-                    progress.progress(
-                        idx / max(len(image_files), 1),
-                        text=f"Reading photo {idx + 1} of {len(image_files)}: {img.name}",
+                try:
+                    extracted = extract_sentences_from_image(
+                        img.read(),
+                        mime_for_filename(img.name),
+                        on_wait=_ocr_wait,
                     )
-
-                    def _ocr_wait(secs, attempt, _idx=idx, _img=img):
-                        try:
-                            progress.progress(
-                                _idx / max(len(image_files), 1),
-                                text=f"Rate limit — waiting {int(secs)}s…",
-                            )
-                        except Exception:
-                            pass
-
-                    try:
-                        extracted = extract_sentences_from_image(
-                            img.read(),
-                            mime_for_filename(img.name),
-                            on_wait=_ocr_wait,
-                        )
-                        sentences.extend(extracted)
-                    except Exception as e:
-                        st.warning(f"Skipped {img.name}: {e}")
-                progress.empty()
+                    sentences.extend(extracted)
+                except Exception as e:
+                    st.warning(f"Skipped {img.name}: {e}")
+            progress.empty()
 
         if not sentences:
             st.error(
@@ -470,7 +410,6 @@ def render_main():
             s["manipuri_mayek"] = bengali_to_meitei_mayek(s.get("manipuri_beng", ""))
 
         st.session_state.sections = sections
-        st.session_state.crop_image_bytes = None  # clear crop cache
 
         progress.empty()
         poem_note = " 🎵 Poem detected — translated poetically." if is_poem else ""
