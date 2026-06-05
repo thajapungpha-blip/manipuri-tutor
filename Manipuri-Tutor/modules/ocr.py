@@ -2,18 +2,29 @@
 
 Students photograph textbook pages with their phones and upload them.
 This module runs each photo through Gemini Vision to extract the body
-text as a clean list of sentences — same format as `pdf_processor.extract_sentences`,
-so the downstream translate pipeline does not need to change.
+text as a clean list of sentences — same format as
+`pdf_processor.extract_sentences`, so the downstream translate pipeline
+does not need to change.
+
+v2: in-process cache keyed by image hash. The same page photo is never
+sent to Gemini twice while the app stays warm — this directly saves your
+daily quota when students re-upload or re-run the same page.
 """
 
 import json
+import hashlib
+
 import streamlit as st
 from google import genai
 from google.genai import types
 
-from modules.rate_limit import call_with_retry
+from modules.rate_limit import call_with_retry  # QuotaExhaustedError propagates
 
 _MODEL_NAME = "gemini-2.5-flash"
+
+# Shared across all sessions in this server process. Bounded to avoid growth.
+_OCR_CACHE: dict[str, list[str]] = {}
+_OCR_CACHE_MAX = 200
 
 _OCR_SYSTEM = """You are an OCR assistant for Class 11 English textbook photographs.
 
@@ -54,7 +65,16 @@ def extract_sentences_from_image(
     mime_type: str,
     on_wait=None,
 ) -> list[str]:
-    """OCR one image; return list of sentences in reading order."""
+    """OCR one image; return list of sentences in reading order.
+
+    Cached by image content hash, so an identical page is never re-sent.
+    May raise rate_limit.QuotaExhaustedError with a student-friendly message.
+    """
+    key = hashlib.sha256(image_bytes).hexdigest()
+    cached = _OCR_CACHE.get(key)
+    if cached is not None:
+        return list(cached)
+
     client = _get_client()
 
     def _call():
@@ -75,8 +95,14 @@ def extract_sentences_from_image(
 
     response = call_with_retry(_call, on_wait=on_wait)
     data = _parse_json(response.text)
-    sentences = data.get("sentences", [])
-    return [s.strip() for s in sentences if isinstance(s, str) and s.strip()]
+    sentences = [s.strip() for s in data.get("sentences", [])
+                 if isinstance(s, str) and s.strip()]
+
+    if sentences:
+        if len(_OCR_CACHE) >= _OCR_CACHE_MAX:
+            _OCR_CACHE.clear()
+        _OCR_CACHE[key] = list(sentences)
+    return sentences
 
 
 _IMAGE_MIME = {
