@@ -1,5 +1,5 @@
 """Gemini translator — English -> Manipuri (Bengali script).
-v2: Poem detection, robust JSON parsing, reduced batch size.
+v3: Poem detection + robust JSON. Fixed client lifecycle bug.
 """
 
 import json
@@ -16,9 +16,6 @@ _MODEL_NAME = "gemini-2.5-flash"
 _BATCH_SIZE = 20
 _INTER_CALL_DELAY_S = 4.0
 
-# ---------------------------------------------------------------------------
-# System instructions
-# ---------------------------------------------------------------------------
 _PROSE_INSTRUCTION = """You are a precise bilingual translator for Manipuri-medium students.
 
 Your ONLY job: translate each English sentence directly into Manipuri (Meiteilon), written in Bengali script.
@@ -39,33 +36,24 @@ The input is POETRY. Translate each verse/line into Manipuri (Meiteilon) in Beng
 1. Preserving the emotional tone and feeling of the original poem.
 2. Keeping the poetic rhythm and flow — do not make it sound like plain prose.
 3. Keeping the same number of output lines as input lines, in the same order.
-4. Preserving any rhyme scheme where naturally possible in Manipuri.
-5. Keeping proper nouns, place names, and cultural references close to the original sound.
-6. Set "math_spoken" to "" always for poetry.
-7. Write Manipuri in Bengali script ONLY.
-8. Return ONLY a JSON object:
+4. Preserving rhyme where naturally possible in Manipuri.
+5. Set "math_spoken" to "" always for poetry.
+6. Write Manipuri in Bengali script ONLY.
+7. Return ONLY a JSON object:
    { "translations": [ { "id": <int>, "manipuri_beng": "...", "math_spoken": "" }, ... ] }
 """
 
 
-# ---------------------------------------------------------------------------
-# Poem detection
-# ---------------------------------------------------------------------------
 def detect_poem(sentences: list[str]) -> bool:
     """Heuristic: short lines + consistent short length = likely poetry."""
     if len(sentences) < 3:
         return False
     word_counts = [len(s.split()) for s in sentences]
     avg_words = sum(word_counts) / len(word_counts)
-    short_lines = sum(1 for w in word_counts if w <= 10)
-    short_ratio = short_lines / len(word_counts)
-    # Poetry: average line < 9 words and >70% of lines are short
+    short_ratio = sum(1 for w in word_counts if w <= 10) / len(word_counts)
     return avg_words < 9 and short_ratio > 0.70
 
 
-# ---------------------------------------------------------------------------
-# JSON parsing
-# ---------------------------------------------------------------------------
 def _repair_json(raw: str) -> str:
     raw = raw.lstrip('\ufeff').strip()
     if raw.startswith('```'):
@@ -78,13 +66,13 @@ def _parse_json(raw: str) -> dict:
     raw = (raw or "").strip()
     if not raw:
         raise RuntimeError("Gemini returned an empty response.")
-    for strict in [True, False]:
+    for strict in (True, False):
         try:
             return json.loads(raw, strict=strict)
         except json.JSONDecodeError:
             pass
     cleaned = _repair_json(raw)
-    for strict in [True, False]:
+    for strict in (True, False):
         try:
             return json.loads(cleaned, strict=strict)
         except json.JSONDecodeError:
@@ -98,16 +86,9 @@ def _parse_json(raw: str) -> dict:
     raise RuntimeError(f"Could not parse Gemini JSON. First 200 chars: {raw[:200]}")
 
 
-# ---------------------------------------------------------------------------
-# Translation
-# ---------------------------------------------------------------------------
-def _get_client():
-    api_key = st.secrets["GEMINI_API_KEY"]
-    return genai.Client(api_key=api_key)
-
-
 def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
-    client = _get_client()
+    """One batch -> aligned list. Creates a fresh client and calls directly
+    (NO nested retry, NO client reuse — avoids 'client has been closed')."""
     system = _POEM_INSTRUCTION if is_poem else _PROSE_INSTRUCTION
     payload = {"sentences": [{"id": i, "english": s} for i, s in enumerate(batch)]}
     prompt = (
@@ -118,19 +99,19 @@ def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
         + json.dumps(payload, ensure_ascii=False)
     )
 
-    def _call():
-        return _get_client().models.generate_content(
-            model=_MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.3 if is_poem else 0.2,
-                max_output_tokens=8192,
-                response_mime_type="application/json",
-            ),
-        )
+    # Fresh client, used immediately, in the same scope. No nesting.
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    response = client.models.generate_content(
+        model=_MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=0.3 if is_poem else 0.2,
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+        ),
+    )
 
-    response = call_with_retry(_call)
     data = _parse_json(response.text)
     translations = data.get("translations", [])
     if not isinstance(translations, list):
@@ -138,12 +119,11 @@ def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
 
     by_id = {}
     for t in translations:
-        if not isinstance(t, dict):
-            continue
-        try:
-            by_id[int(t.get("id"))] = t
-        except (TypeError, ValueError):
-            continue
+        if isinstance(t, dict):
+            try:
+                by_id[int(t.get("id"))] = t
+            except (TypeError, ValueError):
+                pass
 
     aligned = []
     for i, english in enumerate(batch):
@@ -179,6 +159,7 @@ def translate_sentences(sentences: list[str], progress_cb=None,
                             f"Rate limit — waiting {int(secs)}s (retry {attempt})…")
 
         try:
+            # SINGLE retry wrapper around the whole batch call.
             results = call_with_retry(
                 lambda b=batch, p=is_poem: _translate_batch(b, p),
                 on_wait=_on_wait,
@@ -200,6 +181,5 @@ def translate_sentences(sentences: list[str], progress_cb=None,
     return all_results
 
 
-# Backward-compatible alias
 def explain_full_document(chunks, progress_cb=None):
     return translate_sentences(chunks, progress_cb=progress_cb)
