@@ -29,15 +29,15 @@ from modules.firestore_db import (
     set_last_checkout_session,
 )
 from modules.pdf_processor import extract_sentences
-from modules.ocr import (
+from modules.deepseek_ocr import (
     extract_sentences_from_image,
     mime_for_filename,
     IMAGE_EXTENSIONS,
 )
 try:
-    from modules.gemini_tutor import translate_sentences, detect_poem
+    from modules.deepseek_tutor import translate_sentences, detect_poem
 except ImportError:
-    from modules.gemini_tutor import translate_sentences
+    from modules.deepseek_tutor import translate_sentences
     def detect_poem(sentences):
         return False
 from modules.transliterate import bengali_to_meitei_mayek
