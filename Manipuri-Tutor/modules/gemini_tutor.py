@@ -1,5 +1,5 @@
-"""Gemini translator — DIRECT line-by-line English -> Manipuri (Bengali script).
-Fixed: robust JSON parsing for Meitei Mayek Unicode characters.
+"""Gemini translator — English -> Manipuri (Bengali script).
+v2: Poem detection, robust JSON parsing, reduced batch size.
 """
 
 import json
@@ -13,106 +13,118 @@ from google.genai import types
 from modules.rate_limit import call_with_retry
 
 _MODEL_NAME = "gemini-2.5-flash"
-_BATCH_SIZE = 20  # Reduced from 40 to avoid truncation
+_BATCH_SIZE = 20
 _INTER_CALL_DELAY_S = 4.0
 
-SYSTEM_INSTRUCTION = """You are a precise bilingual translator for Manipuri-medium students.
+# ---------------------------------------------------------------------------
+# System instructions
+# ---------------------------------------------------------------------------
+_PROSE_INSTRUCTION = """You are a precise bilingual translator for Manipuri-medium students.
 
-Your ONLY job: translate each English sentence directly into Manipuri (Meiteilon), written in Bengali script (Assamese/Bengali Unicode block).
+Your ONLY job: translate each English sentence directly into Manipuri (Meiteilon), written in Bengali script.
 
-Strict rules:
-1. Translate DIRECTLY, sentence by sentence. Do NOT summarise. Do NOT explain. Do NOT merge sentences.
+Rules:
+1. Translate DIRECTLY, sentence by sentence. Do NOT summarise or merge.
 2. Output must contain EXACTLY the same number of items as the input, in the same order.
-3. Keep all technical terms, units, formulas, equations, chemical symbols, and numbers in English / their original form. Do not transliterate them.
-4. If a sentence contains a mathematical expression, also produce a short spoken-form of just that expression in the "math_spoken" field (e.g. "E equals m c squared"). If there is no math, set "math_spoken" to "".
+3. Keep technical terms, units, formulas, chemical symbols, and numbers in English.
+4. If a sentence contains math, put a short spoken-form in "math_spoken" (e.g. "E equals m c squared"). Otherwise set "math_spoken" to "".
 5. Write Manipuri in Bengali script ONLY. Do not use Meitei Mayek.
-6. Preserve the meaning and tone of the original. Do not add commentary.
-7. Return ONLY a JSON object of this exact shape:
+6. Return ONLY a JSON object:
    { "translations": [ { "id": <int>, "manipuri_beng": "...", "math_spoken": "..." }, ... ] }
-   Where "id" matches the input id for that sentence.
+"""
+
+_POEM_INSTRUCTION = """You are a bilingual literary translator for Manipuri-medium students.
+
+The input is POETRY. Translate each verse/line into Manipuri (Meiteilon) in Bengali script while:
+1. Preserving the emotional tone and feeling of the original poem.
+2. Keeping the poetic rhythm and flow — do not make it sound like plain prose.
+3. Keeping the same number of output lines as input lines, in the same order.
+4. Preserving any rhyme scheme where naturally possible in Manipuri.
+5. Keeping proper nouns, place names, and cultural references close to the original sound.
+6. Set "math_spoken" to "" always for poetry.
+7. Write Manipuri in Bengali script ONLY.
+8. Return ONLY a JSON object:
+   { "translations": [ { "id": <int>, "manipuri_beng": "...", "math_spoken": "" }, ... ] }
 """
 
 
-def _get_client():
-    api_key = st.secrets["GEMINI_API_KEY"]
-    return genai.Client(api_key=api_key)
+# ---------------------------------------------------------------------------
+# Poem detection
+# ---------------------------------------------------------------------------
+def detect_poem(sentences: list[str]) -> bool:
+    """Heuristic: short lines + consistent short length = likely poetry."""
+    if len(sentences) < 3:
+        return False
+    word_counts = [len(s.split()) for s in sentences]
+    avg_words = sum(word_counts) / len(word_counts)
+    short_lines = sum(1 for w in word_counts if w <= 10)
+    short_ratio = short_lines / len(word_counts)
+    # Poetry: average line < 9 words and >70% of lines are short
+    return avg_words < 9 and short_ratio > 0.70
 
 
+# ---------------------------------------------------------------------------
+# JSON parsing
+# ---------------------------------------------------------------------------
 def _repair_json(raw: str) -> str:
-    """Attempt to repair common JSON issues with Unicode text."""
-    # Remove BOM if present
-    raw = raw.lstrip('\ufeff')
-    # Strip markdown fences
-    raw = raw.strip()
+    raw = raw.lstrip('\ufeff').strip()
     if raw.startswith('```'):
         raw = re.sub(r'^```(?:json)?\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
-    raw = raw.strip()
-    return raw
+    return raw.strip()
 
 
 def _parse_json(raw: str) -> dict:
-    """Robust JSON parser that handles Meitei Mayek Unicode and malformed responses."""
     raw = (raw or "").strip()
     if not raw:
         raise RuntimeError("Gemini returned an empty response.")
-
-    # Attempt 1: direct parse
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 2: strict=False (allows control characters in strings)
-    try:
-        return json.loads(raw, strict=False)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 3: repair and parse
+    for strict in [True, False]:
+        try:
+            return json.loads(raw, strict=strict)
+        except json.JSONDecodeError:
+            pass
     cleaned = _repair_json(raw)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 4: repair + strict=False
-    try:
-        return json.loads(cleaned, strict=False)
-    except json.JSONDecodeError:
-        pass
-
-    # Attempt 5: try to extract partial valid JSON using regex
+    for strict in [True, False]:
+        try:
+            return json.loads(cleaned, strict=strict)
+        except json.JSONDecodeError:
+            pass
     match = re.search(r'\{.*"translations"\s*:\s*\[.*?\]\s*\}', cleaned, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(), strict=False)
         except json.JSONDecodeError:
             pass
+    raise RuntimeError(f"Could not parse Gemini JSON. First 200 chars: {raw[:200]}")
 
-    raise RuntimeError(f"Could not parse Gemini JSON response. Raw (first 200 chars): {raw[:200]}")
+
+# ---------------------------------------------------------------------------
+# Translation
+# ---------------------------------------------------------------------------
+def _get_client():
+    api_key = st.secrets["GEMINI_API_KEY"]
+    return genai.Client(api_key=api_key)
 
 
-def _translate_batch(batch: list[str]) -> list[dict]:
-    """Translate one batch. Returns aligned list of dicts of same length as batch."""
+def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
     client = _get_client()
-    payload = {
-        "sentences": [{"id": i, "english": s} for i, s in enumerate(batch)]
-    }
+    system = _POEM_INSTRUCTION if is_poem else _PROSE_INSTRUCTION
+    payload = {"sentences": [{"id": i, "english": s} for i, s in enumerate(batch)]}
     prompt = (
-        "Translate each sentence below directly into Manipuri (Bengali script). "
-        "Return ONLY valid JSON exactly as your instructions specify. "
-        "Make sure all string values are properly escaped. Input:\n\n"
+        ("Translate each verse/line of this poem into Manipuri (Bengali script). "
+         if is_poem else
+         "Translate each sentence into Manipuri (Bengali script). ")
+        + "Return ONLY valid JSON. Input:\n\n"
         + json.dumps(payload, ensure_ascii=False)
     )
 
     def _call():
-        return client.models.generate_content(
+        return _get_client().models.generate_content(
             model=_MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.2,
+                system_instruction=system,
+                temperature=0.3 if is_poem else 0.2,
                 max_output_tokens=8192,
                 response_mime_type="application/json",
             ),
@@ -122,19 +134,18 @@ def _translate_batch(batch: list[str]) -> list[dict]:
     data = _parse_json(response.text)
     translations = data.get("translations", [])
     if not isinstance(translations, list):
-        raise RuntimeError("Gemini response did not contain 'translations' list.")
+        raise RuntimeError("Gemini response missing 'translations' list.")
 
-    by_id: dict[int, dict] = {}
+    by_id = {}
     for t in translations:
         if not isinstance(t, dict):
             continue
         try:
-            tid = int(t.get("id"))
+            by_id[int(t.get("id"))] = t
         except (TypeError, ValueError):
             continue
-        by_id[tid] = t
 
-    aligned: list[dict] = []
+    aligned = []
     for i, english in enumerate(batch):
         t = by_id.get(i, {})
         aligned.append({
@@ -145,8 +156,9 @@ def _translate_batch(batch: list[str]) -> list[dict]:
     return aligned
 
 
-def translate_sentences(sentences: list[str], progress_cb=None) -> list[dict]:
-    all_results: list[dict] = []
+def translate_sentences(sentences: list[str], progress_cb=None,
+                        is_poem: bool = False) -> list[dict]:
+    all_results = []
     total = len(sentences)
     if total == 0:
         if progress_cb:
@@ -158,15 +170,19 @@ def translate_sentences(sentences: list[str], progress_cb=None) -> list[dict]:
     for bi, batch in enumerate(batches):
         if progress_cb:
             progress_cb(done, total,
-                        f"Translating sentences {done + 1}–{done + len(batch)} of {total}…")
+                        f"{'Translating poem' if is_poem else 'Translating'} "
+                        f"lines {done + 1}–{done + len(batch)} of {total}…")
 
-        def _on_wait(secs: float, attempt: int):
+        def _on_wait(secs, attempt):
             if progress_cb:
                 progress_cb(done, total,
                             f"Rate limit — waiting {int(secs)}s (retry {attempt})…")
 
         try:
-            results = call_with_retry(lambda: _translate_batch(batch), on_wait=_on_wait)
+            results = call_with_retry(
+                lambda b=batch, p=is_poem: _translate_batch(b, p),
+                on_wait=_on_wait,
+            )
             all_results.extend(results)
         except Exception as e:
             for english in batch:
@@ -185,5 +201,5 @@ def translate_sentences(sentences: list[str], progress_cb=None) -> list[dict]:
 
 
 # Backward-compatible alias
-def explain_full_document(chunks: list[str], progress_cb=None) -> list[dict]:
+def explain_full_document(chunks, progress_cb=None):
     return translate_sentences(chunks, progress_cb=progress_cb)
