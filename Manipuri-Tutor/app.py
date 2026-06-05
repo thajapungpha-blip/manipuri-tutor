@@ -1,15 +1,11 @@
 """
 Manipuri Tutor — main Streamlit application.
-
-Run locally:
-    streamlit run app.py
-
-Deploy on Streamlit Community Cloud after configuring secrets — see README.md.
+v2: Clear button, image cropper, poem detection.
 """
 
 import html
+import io
 
-# Optional .env support for local dev (Streamlit Cloud uses its own secrets store)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -17,6 +13,7 @@ except Exception:
     pass
 
 import streamlit as st
+from PIL import Image
 
 from modules.auth import (
     initialize_firebase,
@@ -39,7 +36,7 @@ from modules.ocr import (
     mime_for_filename,
     IMAGE_EXTENSIONS,
 )
-from modules.gemini_tutor import translate_sentences
+from modules.gemini_tutor import translate_sentences, detect_poem
 from modules.transliterate import bengali_to_meitei_mayek
 from modules.bhashini_tts import synthesize_speech
 from modules.stripe_payments import (
@@ -49,7 +46,6 @@ from modules.stripe_payments import (
     get_billing_portal_url,
 )
 from modules.styles import inject_css
-
 
 # ---------------------------------------------------------------------------
 # App config
@@ -68,7 +64,6 @@ except Exception as e:
     st.error(f"❌ Firebase failed to initialize: {e}")
     st.stop()
 
-
 # ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
@@ -77,44 +72,34 @@ _DEFAULTS = {
     "email": None,
     "id_token": None,
     "user_data": None,
-    "page": "main",          # main | paywall | account
-    "auth_mode": "login",    # login | signup
-    "sections": None,        # list[ {english, manipuri_beng, manipuri_mayek, math_spoken} ]
+    "page": "main",
+    "auth_mode": "login",
+    "sections": None,
+    "is_poem": False,
     "script_choice": "Meitei Mayek",
     "voice_choice": "Female",
     "uploaded_filename": None,
+    "crop_image_bytes": None,
+    "crop_mime": None,
+    "awaiting_crop": False,
     "_payment_checked": False,
 }
 for _k, _v in _DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
 
 
-# ---------------------------------------------------------------------------
-# App URL helper — used to build Stripe success/cancel URLs
-# ---------------------------------------------------------------------------
 def _app_base_url() -> str:
-    """Return the URL Stripe should redirect back to.
-
-    Configurable via secret APP_BASE_URL. Falls back to localhost so local
-    runs still work.
-    """
     return st.secrets.get("APP_BASE_URL", "http://localhost:8501")
 
 
-# ---------------------------------------------------------------------------
-# Stripe redirect handler — runs on every script run, before UI
-# ---------------------------------------------------------------------------
 def _handle_stripe_return():
-    """If we just came back from Stripe Checkout, verify and activate."""
     if st.session_state._payment_checked:
         return
     qp = st.query_params
     if "session_id" not in qp:
         return
     if not st.session_state.uid:
-        # Can't activate until we know who the user is — keep the param around
         return
-
     sid = qp["session_id"]
     st.session_state._payment_checked = True
     try:
@@ -130,15 +115,11 @@ def _handle_stripe_return():
         elif result["paid"]:
             st.warning("Payment confirmed but UID mismatch. Contact support.")
         else:
-            st.warning(
-                "Payment not yet completed. If you finished checkout, "
-                "tap **Verify payment** below."
-            )
+            st.warning("Payment not yet completed.")
             st.session_state.page = "paywall"
     except Exception as e:
         st.error(f"Could not verify payment: {e}")
     finally:
-        # Clean query params so a refresh doesn't re-run verification
         try:
             st.query_params.clear()
         except Exception:
@@ -149,10 +130,9 @@ _handle_stripe_return()
 
 
 # ---------------------------------------------------------------------------
-# Sidebar — Settings (script + voice) + Sync Subscription
+# Sidebar
 # ---------------------------------------------------------------------------
 def render_sidebar():
-    """Spec 2: Sidebar houses Settings (Script Toggle, Voice Gender)."""
     with st.sidebar:
         st.markdown("### ⚙️ Settings")
         st.session_state.script_choice = st.radio(
@@ -170,18 +150,15 @@ def render_sidebar():
         st.markdown("---")
         st.markdown("### 💳 Subscription")
         if st.button("🔄 Sync subscription", key="sb_sync_sub",
-                     use_container_width=True,
-                     help="Re-check your latest Stripe payment and update your account."):
+                     use_container_width=True):
             _sync_subscription_from_stripe()
 
 
 def _sync_subscription_from_stripe():
-    """Look up the user's most recent Checkout Session in Firestore, ask
-    Stripe whether it's paid, and update the user doc if it is."""
     user = refresh_user(st.session_state.uid) or {}
     sid = user.get("last_stripe_session_id")
     if not sid:
-        st.sidebar.warning("No recent checkout to sync. Start a subscription first.")
+        st.sidebar.warning("No recent checkout to sync.")
         return
     try:
         result = verify_payment(sid)
@@ -193,7 +170,7 @@ def _sync_subscription_from_stripe():
             )
             st.sidebar.success("✅ Subscription is active.")
         else:
-            st.sidebar.info("Stripe says the payment is not yet completed.")
+            st.sidebar.info("Payment not yet completed.")
     except Exception as e:
         st.sidebar.error(f"Sync failed: {e}")
 
@@ -229,7 +206,7 @@ def render_header():
 
 
 # ---------------------------------------------------------------------------
-# Auth screens
+# Auth
 # ---------------------------------------------------------------------------
 def render_auth():
     render_header()
@@ -292,7 +269,6 @@ def render_auth():
 
 
 def _post_auth(resp: dict):
-    """Persist auth state and load user profile from Firestore."""
     uid = resp["localId"]
     email = resp["email"]
     st.session_state.uid = uid
@@ -302,19 +278,53 @@ def _post_auth(resp: dict):
 
 
 # ---------------------------------------------------------------------------
-# Main app: upload + dual-pane
+# Clear helper
+# ---------------------------------------------------------------------------
+def _clear_translation():
+    st.session_state.sections = None
+    st.session_state.uploaded_filename = None
+    st.session_state.is_poem = False
+    st.session_state.awaiting_crop = False
+    st.session_state.crop_image_bytes = None
+    st.session_state.crop_mime = None
+    # Clear all audio cache
+    for k in list(st.session_state.keys()):
+        if k.startswith("audio_") or k.startswith("full_audio"):
+            del st.session_state[k]
+
+
+# ---------------------------------------------------------------------------
+# Image crop helper
+# ---------------------------------------------------------------------------
+def _show_cropper(img_file) -> bytes | None:
+    """Show crop interface for a single image. Returns cropped bytes or None."""
+    try:
+        from streamlit_cropper import st_cropper
+        pil_img = Image.open(img_file)
+        st.markdown("### ✂️ Crop your photo")
+        st.caption("Drag the corners to select only the textbook page. Then click **Use this crop**.")
+        cropped = st_cropper(
+            pil_img,
+            realtime_update=True,
+            box_color="#4CAF50",
+            aspect_ratio=None,
+        )
+        if st.button("✅ Use this crop", type="primary", key="btn_use_crop"):
+            buf = io.BytesIO()
+            cropped.save(buf, format="JPEG", quality=95)
+            return buf.getvalue()
+        return None
+    except ImportError:
+        # streamlit-cropper not installed — skip crop
+        img_file.seek(0)
+        return img_file.read()
+
+
+# ---------------------------------------------------------------------------
+# Main app
 # ---------------------------------------------------------------------------
 def render_main():
     render_header()
-
-    cfg = load_subscription_config()
-    trial_limit = cfg["free_trial_limit"]
-
-    # Refresh user data on each render
-    st.session_state.user_data = refresh_user(st.session_state.uid)
-    user = st.session_state.user_data
-    subscribed = is_subscription_active(user)
-    remaining = trial_remaining(user, trial_limit)
 
     # Status banner — FREE FOR ALL
     st.markdown(
@@ -322,10 +332,17 @@ def render_main():
         unsafe_allow_html=True,
     )
 
-    # Controls (Script + Voice) now live in the sidebar — see render_sidebar().
+    # Clear button — only show when translation exists
+    if st.session_state.sections:
+        if st.button("🗑️ New Translation", key="btn_clear", type="secondary"):
+            _clear_translation()
+            st.rerun()
 
-    # Upload + process
-    can_process = True  # FREE FOR ALL — subscription disabled for now
+    can_process = True
+
+    # ------------------------------------------------------------------
+    # Upload
+    # ------------------------------------------------------------------
     uploaded_files = st.file_uploader(
         "Upload a PDF or photos of textbook pages",
         type=["pdf", "jpg", "jpeg", "png", "webp"],
@@ -333,124 +350,155 @@ def render_main():
         disabled=not can_process,
         key="pdf_uploader",
         help=(
-            "You can upload a textbook PDF, or take phone photos of the "
-            "pages you want translated and upload them in reading order."
+            "Upload a textbook PDF, or take phone photos of pages. "
+            "For photos, upload one page at a time for best results."
         ),
     )
 
-    # Build a stable identifier so we do not reprocess on every Streamlit rerun
     upload_id = None
     if uploaded_files:
         upload_id = "|".join(f"{f.name}:{f.size}" for f in uploaded_files)
 
+    # ------------------------------------------------------------------
+    # New upload detected
+    # ------------------------------------------------------------------
     if uploaded_files and upload_id != st.session_state.uploaded_filename:
-        # New upload — process it
-        if not can_process:
-            st.error("Free trial used. Please subscribe.")
-            return
-
         st.session_state.uploaded_filename = upload_id
         st.session_state.sections = None
+        st.session_state.is_poem = False
+        st.session_state.awaiting_crop = False
 
-        # Separate PDFs from images
-        pdf_files = [f for f in uploaded_files
-                     if f.name.lower().endswith(".pdf")]
+        pdf_files = [f for f in uploaded_files if f.name.lower().endswith(".pdf")]
         image_files = [f for f in uploaded_files
                        if f.name.lower().endswith(IMAGE_EXTENSIONS)]
 
         sentences: list[str] = []
 
         if pdf_files:
-            # PDF mode — use the first PDF only (mixing modes is confusing)
             if len(uploaded_files) > 1:
-                st.info(
-                    "PDF detected — additional files were ignored. "
-                    "To OCR photos, upload images only (no PDF)."
-                )
+                st.info("PDF detected — only the first PDF is used.")
             with st.spinner("Reading PDF…"):
                 try:
                     sentences = extract_sentences(pdf_files[0].read())
                 except Exception as e:
                     st.error(f"Could not read PDF: {e}")
                     return
+
         elif image_files:
-            # Image mode — OCR each photo via Gemini Vision
-            progress = st.progress(0.0, text="Reading photos…")
-            for idx, img in enumerate(image_files):
-                progress.progress(
-                    idx / max(len(image_files), 1),
-                    text=f"Reading photo {idx + 1} of {len(image_files)}: {img.name}",
-                )
+            # Single image: show cropper first
+            if len(image_files) == 1:
+                img_file = image_files[0]
+                mime = mime_for_filename(img_file.name)
 
-                def _ocr_wait(secs: float, attempt: int, _idx=idx, _img=img):
+                # Check if cropper result is already stored
+                if not st.session_state.crop_image_bytes:
+                    st.session_state.crop_mime = mime
+                    img_file.seek(0)
+                    cropped_bytes = _show_cropper(img_file)
+                    if cropped_bytes is None:
+                        # Waiting for user to confirm crop
+                        return
+                    st.session_state.crop_image_bytes = cropped_bytes
+
+                # Use stored cropped image
+                with st.spinner("Reading photo…"):
                     try:
-                        progress.progress(
-                            _idx / max(len(image_files), 1),
-                            text=(
-                                f"Free-tier rate limit reached — waiting "
-                                f"{int(secs)}s before reading {_img.name}…"
-                            ),
+                        sentences = extract_sentences_from_image(
+                            st.session_state.crop_image_bytes,
+                            st.session_state.crop_mime or mime,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        st.error(f"Could not read photo: {e}")
+                        return
 
-                try:
-                    extracted = extract_sentences_from_image(
-                        img.read(),
-                        mime_for_filename(img.name),
-                        on_wait=_ocr_wait,
+            else:
+                # Multiple images: no crop, process all
+                st.info("Multiple photos detected — cropping skipped. Upload one at a time for cropping.")
+                progress = st.progress(0.0, text="Reading photos…")
+                for idx, img in enumerate(image_files):
+                    progress.progress(
+                        idx / max(len(image_files), 1),
+                        text=f"Reading photo {idx + 1} of {len(image_files)}: {img.name}",
                     )
-                    sentences.extend(extracted)
-                except Exception as e:
-                    st.warning(f"Skipped {img.name}: {e}")
-            progress.empty()
+
+                    def _ocr_wait(secs, attempt, _idx=idx, _img=img):
+                        try:
+                            progress.progress(
+                                _idx / max(len(image_files), 1),
+                                text=f"Rate limit — waiting {int(secs)}s…",
+                            )
+                        except Exception:
+                            pass
+
+                    try:
+                        extracted = extract_sentences_from_image(
+                            img.read(),
+                            mime_for_filename(img.name),
+                            on_wait=_ocr_wait,
+                        )
+                        sentences.extend(extracted)
+                    except Exception as e:
+                        st.warning(f"Skipped {img.name}: {e}")
+                progress.empty()
 
         if not sentences:
             st.error(
-                "Could not extract any text. For PDFs, check the file is "
-                "not scan-only. For photos, make sure the page is in focus "
-                "and well-lit."
+                "Could not extract any text. For PDFs, check the file is not "
+                "scan-only. For photos, make sure the page is in focus and well-lit."
             )
             return
+
+        # Detect poem
+        is_poem = detect_poem(sentences)
+        st.session_state.is_poem = is_poem
 
         progress = st.progress(0.0, text="Starting translation…")
 
         def _cb(done, total, msg):
             try:
-                progress.progress(
-                    min(1.0, done / max(total, 1)),
-                    text=msg,
-                )
+                progress.progress(min(1.0, done / max(total, 1)), text=msg)
             except Exception:
                 pass
 
         try:
-            sections = translate_sentences(sentences, progress_cb=_cb)
+            sections = translate_sentences(sentences, progress_cb=_cb, is_poem=is_poem)
         except Exception as e:
             st.error(f"Gemini failed: {e}")
             return
 
-        # Transliterate each section's Manipuri text to Meitei Mayek
         for s in sections:
             s["manipuri_mayek"] = bengali_to_meitei_mayek(s.get("manipuri_beng", ""))
 
         st.session_state.sections = sections
-
-        # Trial tracking disabled — app is free for all
-        # if not subscribed:
-        #     st.session_state.user_data = increment_trial(st.session_state.uid)
+        st.session_state.crop_image_bytes = None  # clear crop cache
 
         progress.empty()
-        st.success(f"Translated {len(sections)} line{'s' if len(sections) != 1 else ''}.")
+        poem_note = " 🎵 Poem detected — translated poetically." if is_poem else ""
+        st.success(f"Translated {len(sections)} line{'s' if len(sections) != 1 else ''}.{poem_note}")
         st.rerun()
 
-    # Render sections
+    # ------------------------------------------------------------------
+    # Render results
+    # ------------------------------------------------------------------
     if st.session_state.sections:
         sections = st.session_state.sections
         voice = st.session_state.voice_choice
+        is_poem = st.session_state.get("is_poem", False)
 
-        # Full audio button at the top
-        st.markdown("### 🔊 Full Audio")
+        # Clear button (top of results)
+        col_title, col_btn = st.columns([4, 1])
+        with col_title:
+            if is_poem:
+                st.markdown("### 🎵 Poem Translation")
+                st.caption("Poetry detected — translation preserves verse structure and feeling.")
+            else:
+                st.markdown("### 🔊 Full Audio")
+        with col_btn:
+            if st.button("🗑️ Clear", key="btn_clear2", type="secondary"):
+                _clear_translation()
+                st.rerun()
+
+        # Full audio
         full_audio_key = f"full_audio_{voice.lower()}"
         if st.button(f"▶️ Play Full Translation ({voice})", key="btn_full_audio",
                      use_container_width=False, type="primary"):
@@ -462,11 +510,9 @@ def render_main():
                     )
                     audio_bytes = synthesize_speech(full_text, voice.lower())
                     st.session_state[full_audio_key] = audio_bytes
-                except Exception as e:
+                except Exception:
                     st.info(
-                        "🎧 **Audio coming soon** — Manipuri voice playback "
-                        "is currently being integrated with Bhashini TTS. "
-                        "It will be enabled once the API access is approved."
+                        "🎧 **Audio coming soon** — Bhashini TTS integration pending approval."
                     )
                     st.session_state[full_audio_key] = None
 
@@ -475,16 +521,14 @@ def render_main():
 
         st.markdown("### Line-by-line translation")
         for i, sec in enumerate(sections):
-            _render_section(i, sec)
+            _render_section(i, sec, is_poem=is_poem)
 
 
-def _render_section(i: int, sec: dict):
+def _render_section(i: int, sec: dict, is_poem: bool = False):
     with st.container():
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="section-header">Line {i + 1}</div>',
-            unsafe_allow_html=True,
-        )
+        label = f"{'Verse' if is_poem else 'Line'} {i + 1}"
+        st.markdown(f'<div class="section-header">{label}</div>', unsafe_allow_html=True)
 
         col_en, col_mn = st.columns(2)
         with col_en:
@@ -495,48 +539,36 @@ def _render_section(i: int, sec: dict):
             )
         with col_mn:
             if st.session_state.script_choice == "Meitei Mayek":
-                label = "Manipuri · Meitei Mayek"
+                label_mn = "Manipuri · Meitei Mayek"
                 css_class = "manipuri-mayek"
                 text = sec.get("manipuri_mayek") or ""
             else:
-                label = "Manipuri · Bengali Script"
+                label_mn = "Manipuri · Bengali Script"
                 css_class = "manipuri-beng"
                 text = sec.get("manipuri_beng") or ""
-            st.markdown(
-                f'<div class="pane-label">{label}</div>',
-                unsafe_allow_html=True,
-            )
+            st.markdown(f'<div class="pane-label">{label_mn}</div>', unsafe_allow_html=True)
             st.markdown(
                 f'<div class="{css_class}">{html.escape(text)}</div>',
                 unsafe_allow_html=True,
             )
 
-        # Audio button — keyed by section + voice so switching voice re-fetches
         voice = st.session_state.voice_choice
         audio_key = f"audio_sec{i}_{voice.lower()}"
         btn_key = f"btn_audio_{i}_{voice.lower()}"
 
         ac1, ac2 = st.columns([1, 4])
         with ac1:
-            play = st.button(f"🔊 Play ({voice})", key=btn_key,
-                             use_container_width=True)
+            play = st.button(f"🔊 Play ({voice})", key=btn_key, use_container_width=True)
         if play:
             with st.spinner("Generating audio…"):
                 try:
                     text_for_tts = sec.get("manipuri_beng", "")
                     if sec.get("math_spoken"):
-                        text_for_tts = (text_for_tts + " " +
-                                        sec["math_spoken"]).strip()
+                        text_for_tts = (text_for_tts + " " + sec["math_spoken"]).strip()
                     audio_bytes = synthesize_speech(text_for_tts, voice.lower())
                     st.session_state[audio_key] = audio_bytes
                 except Exception:
-                    # Bhashini approval is pending. Show a polished
-                    # placeholder instead of the raw API error.
-                    st.info(
-                        "🎧 **Audio coming soon** — Manipuri voice playback "
-                        "is currently being integrated with Bhashini TTS. "
-                        "It will be enabled once the API access is approved."
-                    )
+                    st.info("🎧 Audio coming soon — Bhashini TTS pending approval.")
                     st.session_state[audio_key] = None
 
         if st.session_state.get(audio_key):
@@ -552,13 +584,7 @@ def render_paywall():
     render_header()
     cfg = load_subscription_config()
     plans = cfg["plans"]
-
     st.markdown("## Choose a plan")
-    st.markdown(
-        "Unlimited PDF explanations, Meitei Mayek + Bengali script, "
-        "and audio lectures."
-    )
-
     cols = st.columns(len(plans))
     for col, (plan_key, plan) in zip(cols, plans.items()):
         featured = plan.get("featured", False)
@@ -571,12 +597,9 @@ def render_paywall():
                 f'</div>',
                 unsafe_allow_html=True,
             )
-            if st.button(
-                f"Subscribe — ₹{plan['price_inr']}",
-                key=f"plan_btn_{plan_key}",
-                type="primary" if featured else "secondary",
-                use_container_width=True,
-            ):
+            if st.button(f"Subscribe — ₹{plan['price_inr']}", key=f"plan_btn_{plan_key}",
+                         type="primary" if featured else "secondary",
+                         use_container_width=True):
                 try:
                     base = _app_base_url()
                     checkout_url, sid = create_checkout_session(
@@ -586,66 +609,25 @@ def render_paywall():
                         success_url=base,
                         cancel_url=base,
                     )
-                    # Remember the session id so "Sync subscription" can
-                    # re-check it even if the success redirect is missed.
                     try:
                         set_last_checkout_session(st.session_state.uid, sid)
                     except Exception:
                         pass
-                    st.markdown(
-                        f'<meta http-equiv="refresh" '
-                        f'content="0;url={checkout_url}">',
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(
-                        f"If you are not redirected, "
-                        f"[tap here to pay]({checkout_url})."
-                    )
+                    st.markdown(f'<meta http-equiv="refresh" content="0;url={checkout_url}">',
+                                unsafe_allow_html=True)
+                    st.markdown(f"[Tap here to pay]({checkout_url})")
                 except Exception as e:
                     st.error(f"Could not start checkout: {e}")
 
-    st.markdown("---")
-    st.markdown("### Already paid?")
-    st.caption(
-        "If you completed payment but your subscription isn't active, "
-        "tap **Sync subscription** in the sidebar — or paste your Stripe "
-        "session ID below."
-    )
-    sid = st.text_input(
-        "Stripe session ID (optional)",
-        key="manual_sid",
-    )
-    if st.button("Sync subscription", key="manual_verify"):
-        if not sid.strip():
-            # Fall back to the stored session id
-            _sync_subscription_from_stripe()
-            return
-        try:
-            result = verify_payment(sid.strip())
-            if result["paid"] and result["uid"] == st.session_state.uid:
-                st.session_state.user_data = activate_subscription(
-                    st.session_state.uid,
-                    result["duration_days"],
-                    stripe_customer_id=result.get("customer_id"),
-                )
-                st.success("✅ Subscription activated.")
-                st.session_state.page = "main"
-                st.rerun()
-            else:
-                st.warning("Payment is not yet marked as paid.")
-        except Exception as e:
-            st.error(f"Sync failed: {e}")
-
 
 # ---------------------------------------------------------------------------
-# Account page
+# Account
 # ---------------------------------------------------------------------------
 def render_account():
     render_header()
     st.markdown("## Your account")
     user = refresh_user(st.session_state.uid) or {}
     st.session_state.user_data = user
-
     st.markdown(f"**Email:** {st.session_state.email}")
 
     if is_subscription_active(user):
@@ -657,38 +639,28 @@ def render_account():
             unsafe_allow_html=True,
         )
     else:
-        st.markdown(
-            '<div class="trial-banner">Subscription: <b>Inactive</b></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="trial-banner">Subscription: <b>Inactive</b></div>',
+                    unsafe_allow_html=True)
         if st.button("Subscribe →", type="primary", key="account_subscribe"):
             st.session_state.page = "paywall"
             st.rerun()
 
     cfg = load_subscription_config()
-    st.markdown(
-        f"**Free trial used:** {user.get('trial_files_processed', 0)} "
-        f"/ {cfg['free_trial_limit']}"
-    )
-
+    st.markdown(f"**Free trial used:** {user.get('trial_files_processed', 0)} / {cfg['free_trial_limit']}")
     st.markdown("---")
     ac1, ac2 = st.columns(2)
     with ac1:
-        if st.button("🔄 Sync subscription from Stripe",
-                     key="account_sync_sub", use_container_width=True):
+        if st.button("🔄 Sync subscription", key="account_sync_sub", use_container_width=True):
             _sync_subscription_from_stripe()
             st.rerun()
     with ac2:
         cust = user.get("stripe_customer_id")
         if cust:
-            if st.button("Manage billing (Stripe portal)",
-                         key="open_portal", use_container_width=True):
+            if st.button("Manage billing", key="open_portal", use_container_width=True):
                 try:
                     url = get_billing_portal_url(cust, _app_base_url())
-                    st.markdown(
-                        f'<meta http-equiv="refresh" content="0;url={url}">',
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(f'<meta http-equiv="refresh" content="0;url={url}">',
+                                unsafe_allow_html=True)
                     st.markdown(f"[Open billing portal]({url})")
                 except Exception as e:
                     st.error(f"Could not open billing portal: {e}")
@@ -701,7 +673,6 @@ def main():
     if not st.session_state.uid:
         render_auth()
         return
-    # Sidebar (Settings + Sync subscription) appears on every logged-in page
     render_sidebar()
     page = st.session_state.page
     if page == "paywall":
