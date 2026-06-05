@@ -1,5 +1,5 @@
 """Gemini translator — English -> Manipuri (Bengali script).
-v3: Poem detection + robust JSON. Fixed client lifecycle bug.
+v4: Stops hammering the API once the quota is gone (QuotaExhaustedError).
 """
 
 import json
@@ -10,7 +10,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-from modules.rate_limit import call_with_retry
+from modules.rate_limit import call_with_retry, QuotaExhaustedError
 
 _MODEL_NAME = "gemini-2.5-flash"
 _BATCH_SIZE = 20
@@ -87,8 +87,8 @@ def _parse_json(raw: str) -> dict:
 
 
 def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
-    """One batch -> aligned list. Creates a fresh client and calls directly
-    (NO nested retry, NO client reuse — avoids 'client has been closed')."""
+    """One batch -> aligned list. Fresh client, used immediately (avoids the
+    'client has been closed' bug). No nested retry."""
     system = _POEM_INSTRUCTION if is_poem else _PROSE_INSTRUCTION
     payload = {"sentences": [{"id": i, "english": s} for i, s in enumerate(batch)]}
     prompt = (
@@ -99,7 +99,6 @@ def _translate_batch(batch: list[str], is_poem: bool = False) -> list[dict]:
         + json.dumps(payload, ensure_ascii=False)
     )
 
-    # Fresh client, used immediately, in the same scope. No nesting.
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     response = client.models.generate_content(
         model=_MODEL_NAME,
@@ -159,12 +158,31 @@ def translate_sentences(sentences: list[str], progress_cb=None,
                             f"Rate limit — waiting {int(secs)}s (retry {attempt})…")
 
         try:
-            # SINGLE retry wrapper around the whole batch call.
             results = call_with_retry(
                 lambda b=batch, p=is_poem: _translate_batch(b, p),
                 on_wait=_on_wait,
             )
             all_results.extend(results)
+        except QuotaExhaustedError as e:
+            # Quota is gone — stop hammering. Mark this batch + all remaining
+            # lines with the friendly message, then return immediately.
+            msg = str(e)
+            for english in batch:
+                all_results.append({
+                    "english": english,
+                    "manipuri_beng": f"[{msg}]",
+                    "math_spoken": "",
+                })
+            for remaining in batches[bi + 1:]:
+                for english in remaining:
+                    all_results.append({
+                        "english": english,
+                        "manipuri_beng": "[Not translated — limit reached]",
+                        "math_spoken": "",
+                    })
+            if progress_cb:
+                progress_cb(total, total, msg)
+            return all_results
         except Exception as e:
             for english in batch:
                 all_results.append({
@@ -172,6 +190,7 @@ def translate_sentences(sentences: list[str], progress_cb=None,
                     "manipuri_beng": f"[Translation failed: {e}]",
                     "math_spoken": "",
                 })
+
         done += len(batch)
         if bi < len(batches) - 1:
             time.sleep(_INTER_CALL_DELAY_S)
